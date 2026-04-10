@@ -1,0 +1,14 @@
+﻿Build a single-file public-indicators monitoring dashboard for the twin cities of Mafra (SC) and Rio Negro (PR) in southern Brazil, for use on a city hall lobby TV and as a public website.
+
+HARD REQUIREMENTS:
+- Output a single file `index.html` at the project root (self-contained: inline CSS + JS, no build step).
+- The dashboard must display, side by side, indicator tiles for BOTH cities covering at minimum: air quality (AQI / PM2.5), current weather and 24h forecast, river level of the Rio Negro river (flood risk is a real concern here), traffic/road conditions on BR-116 between the two cities, COVID or general health indicators, population and demographic basics, and any other public-data indicator you can source.
+- Use REAL public data sources where possible (OpenAQ, Open-Meteo, INMET, ANA/SGB river gauges, DER-SC/DER-PR, DATASUS, IBGE). If a source is not reachable from static JS, fall back to a clearly labeled mocked value and document the source URL in a comment.
+- Design for a 1080p lobby TV: large typography, high contrast, dark theme by default, auto-refresh every 5 minutes, timestamp visible.
+- Add a city-hall-appropriate header with both municipal coats of arms (use placeholder SVGs if you cannot fetch the real ones) and the current date/time in pt-BR.
+- Accessible: semantic HTML, proper landmarks, aria-labels, readable at 3 m distance.
+- At the end of each round, capture a screenshot of the rendered page at 1920x1080 and save it to ./screenshots/round_<N>.png using Microsoft Edge headless:
+    "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --headless --disable-gpu --window-size=1920,1080 --screenshot="%CD%\screenshots\round_<N>.png" "file:///%CD%/index.html"
+  Create the screenshots directory if missing. Verify the PNG exists before finishing.
+
+End your turn with a CHANGELOG of exactly what you changed this round and which data sources are live vs mocked.
