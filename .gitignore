@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+_arbiter.out
+_arbiter.err
+_arbiter.pid
+_launch.cmd
+_gitout.txt
