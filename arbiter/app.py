@@ -1,4 +1,11 @@
-"""Arbiter v2 — three-pane interactive TUI: Gemini | You | Claude."""
+"""Arbiter v2 — three-pane interactive TUI: Gemini | You | Claude.
+
+Each agent pane is self-contained with its own log and input field.
+The center pane is a narrow control strip for arbiter commands and
+loop status. Type directly into Gemini or Claude panes to talk to
+that agent, or use the center input for commands (/loop, /stop, etc.)
+and messages that go to both agents.
+"""
 from __future__ import annotations
 
 import argparse
@@ -118,15 +125,21 @@ class ArbiterApp(App):
     }
     #gemini_pane { border-title-color: $warning; }
     #center_pane {
-        width: 1fr;
+        width: auto;
+        min-width: 28;
+        max-width: 40;
         border: round $accent;
         border-title-color: $accent;
-        min-width: 30;
     }
     #claude_pane { border-title-color: $success; }
 
     RichLog { height: 1fr; }
-    #user_input {
+
+    .agent_input {
+        dock: bottom;
+        margin: 0 0;
+    }
+    #arbiter_input {
         dock: bottom;
         margin: 0 0;
     }
@@ -134,7 +147,9 @@ class ArbiterApp(App):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
-        Binding("escape", "focus_input", "Focus input", show=False),
+        Binding("ctrl+g", "focus_gemini", "Gemini", show=True),
+        Binding("ctrl+b", "focus_both", "Both", show=True),
+        Binding("ctrl+l", "focus_claude", "Claude", show=True),
     ]
 
     def __init__(
@@ -166,19 +181,32 @@ class ArbiterApp(App):
         yield Header(show_clock=True)
         yield Static("", id="status_bar")
         with Horizontal(id="panes"):
+            # ── Gemini pane (self-contained) ──
             with Vertical(classes="agent_pane", id="gemini_pane") as gp:
                 gp.border_title = "⚖  Gemini — JUDGE"
                 yield RichLog(id="gemini_log", highlight=False, markup=False, wrap=True)
+                yield Input(
+                    placeholder="Talk to Gemini...",
+                    id="gemini_input",
+                    classes="agent_input",
+                )
+            # ── Center control pane ──
             with Vertical(id="center_pane") as cp:
-                cp.border_title = "💬  You — ARBITER"
+                cp.border_title = "💬  ARBITER"
                 yield RichLog(id="center_log", highlight=False, markup=False, wrap=True)
                 yield Input(
-                    placeholder="/help for commands — type a message to talk to both agents",
-                    id="user_input",
+                    placeholder="/loop /stop /help — or type to both",
+                    id="arbiter_input",
                 )
+            # ── Claude pane (self-contained) ──
             with Vertical(classes="agent_pane", id="claude_pane") as clp:
-                clp.border_title = "🛠  Claude Code — BUILDER"
+                clp.border_title = "🛠  Claude — BUILDER"
                 yield RichLog(id="claude_log", highlight=False, markup=False, wrap=True)
+                yield Input(
+                    placeholder="Talk to Claude...",
+                    id="claude_input",
+                    classes="agent_input",
+                )
         yield Footer()
 
     def _update_status(self, extra: str = "") -> None:
@@ -229,23 +257,34 @@ class ArbiterApp(App):
 
     def _welcome(self) -> None:
         cl = self.query_one("#center_log", RichLog)
-        cl.write("Welcome to Arbiter v2")
-        cl.write(f"Project: {self.project_dir}")
+        cl.write("Arbiter v2")
+        cl.write(f"Project: {os.path.basename(self.project_dir or '')}")
         cl.write("")
-        cl.write("Talk to both agents, or use commands:")
-        cl.write("  /claude <msg>   → Claude only")
-        cl.write("  /gemini <msg>   → Gemini only")
-        cl.write("  <msg>           → both agents")
-        cl.write("  /loop [N] [score] → auto build→judge loop")
-        cl.write("  /stop /pause /resume /status /help")
+        cl.write("Each pane has its own input.")
+        cl.write("Type here to send to both.")
         cl.write("")
+        cl.write("Ctrl+G = Gemini input")
+        cl.write("Ctrl+B = Both (center)")
+        cl.write("Ctrl+L = Claude input")
+        cl.write("")
+        cl.write("/loop [N] [score]")
+        cl.write("/stop /pause /resume")
+        cl.write("/status /help /quit")
         if self._initial_task:
-            cl.write(f"Task loaded: {self._initial_task[:120]}...")
-            cl.write("Type /loop to start the auto-iterate loop, or just chat.")
-        self.query_one("#user_input", Input).focus()
+            cl.write("")
+            cl.write(f"Task: {self._initial_task[:80]}...")
+        self.query_one("#arbiter_input", Input).focus()
 
-    def action_focus_input(self) -> None:
-        self.query_one("#user_input", Input).focus()
+    # ── Focus actions ─────────────────────────────────────────
+
+    def action_focus_gemini(self) -> None:
+        self.query_one("#gemini_input", Input).focus()
+
+    def action_focus_claude(self) -> None:
+        self.query_one("#claude_input", Input).focus()
+
+    def action_focus_both(self) -> None:
+        self.query_one("#arbiter_input", Input).focus()
 
     # ── Log helpers (thread-safe) ─────────────────────────────
 
@@ -262,15 +301,54 @@ class ArbiterApp(App):
         """Use when already on the main thread."""
         self.query_one("#center_log", RichLog).write(line)
 
-    # ── Input handling ────────────────────────────────────────
+    # ── Input handling — each pane submits independently ──────
 
-    @on(Input.Submitted, "#user_input")
-    def on_user_submit(self, event: Input.Submitted) -> None:
-        raw = event.value
+    @on(Input.Submitted, "#gemini_input")
+    def on_gemini_submit(self, event: Input.Submitted) -> None:
+        raw = event.value.strip()
         event.input.value = ""
-        if not raw.strip():
+        if not raw:
             return
+        # Check for arbiter commands first (they work from any input)
+        cmd = parse(raw)
+        if cmd.action != Action.MESSAGE:
+            self._handle_command(cmd, raw)
+            return
+        # Direct message to Gemini
+        if not self.project_dir:
+            self._log_center_sync("No project selected.")
+            return
+        self.query_one("#gemini_log", RichLog).write(f"─── You ───")
+        self.query_one("#gemini_log", RichLog).write(raw[:300])
+        self.query_one("#gemini_log", RichLog).write(f"─── Gemini ───")
+        asyncio.create_task(self._send_to_gemini_raw(raw))
 
+    @on(Input.Submitted, "#claude_input")
+    def on_claude_submit(self, event: Input.Submitted) -> None:
+        raw = event.value.strip()
+        event.input.value = ""
+        if not raw:
+            return
+        # Check for arbiter commands first
+        cmd = parse(raw)
+        if cmd.action != Action.MESSAGE:
+            self._handle_command(cmd, raw)
+            return
+        # Direct message to Claude
+        if not self.project_dir:
+            self._log_center_sync("No project selected.")
+            return
+        self.query_one("#claude_log", RichLog).write(f"─── You ───")
+        self.query_one("#claude_log", RichLog).write(raw[:300])
+        self.query_one("#claude_log", RichLog).write(f"─── Claude ───")
+        asyncio.create_task(self._send_to_claude_raw(raw))
+
+    @on(Input.Submitted, "#arbiter_input")
+    def on_arbiter_submit(self, event: Input.Submitted) -> None:
+        raw = event.value.strip()
+        event.input.value = ""
+        if not raw:
+            return
         cmd = parse(raw)
         self._handle_command(cmd, raw)
 
@@ -304,12 +382,12 @@ class ArbiterApp(App):
             if cmd.text and os.path.isdir(cmd.text):
                 self.project_dir = os.path.abspath(cmd.text)
                 self._init_agents()
-                cl.write(f"Project changed to: {self.project_dir}")
+                cl.write(f"Project: {self.project_dir}")
             elif cmd.text:
                 os.makedirs(cmd.text, exist_ok=True)
                 self.project_dir = os.path.abspath(cmd.text)
                 self._init_agents()
-                cl.write(f"Created and switched to: {self.project_dir}")
+                cl.write(f"Created: {self.project_dir}")
             else:
                 cl.write("Usage: /project <path>")
             return
@@ -321,7 +399,7 @@ class ArbiterApp(App):
 
         if cmd.action == Action.PAUSE:
             self._loop_paused = True
-            cl.write("Paused — will stop after current agent finishes. /resume to continue.")
+            cl.write("Paused. /resume to continue.")
             self._update_status()
             return
 
@@ -333,7 +411,7 @@ class ArbiterApp(App):
 
         if cmd.action == Action.LOOP_START:
             if not self._initial_task and not cmd.text:
-                cl.write("No task set. Send a message first, then /loop to iterate on it.")
+                cl.write("No task. Send a message first.")
                 return
             task = self._initial_task or cmd.text or ""
             self._start_loop(task, cmd.rounds, cmd.stop_score)
@@ -341,7 +419,7 @@ class ArbiterApp(App):
 
         if cmd.action == Action.MESSAGE:
             if not self.project_dir:
-                cl.write("No project selected. Use /project <path>.")
+                cl.write("No project. Use /project <path>.")
                 return
             self._send_message(cmd)
             return
@@ -349,6 +427,7 @@ class ArbiterApp(App):
     # ── Message sending ───────────────────────────────────────
 
     def _send_message(self, cmd: Command) -> None:
+        """Route message from the center (arbiter) input."""
         cl = self.query_one("#center_log", RichLog)
         target_label = {
             Target.CLAUDE: "→ claude",
@@ -356,29 +435,29 @@ class ArbiterApp(App):
             Target.BOTH: "→ both",
         }
         label = target_label.get(cmd.target, "→ both")
-        cl.write(f"  [{label}] {cmd.text[:200]}")
+        cl.write(f"  [{label}] {cmd.text[:120]}")
 
-        if cmd.target == Target.CLAUDE or cmd.target == Target.BOTH:
-            asyncio.create_task(self._send_to_claude(cmd.text))
-        if cmd.target == Target.GEMINI or cmd.target == Target.BOTH:
-            asyncio.create_task(self._send_to_gemini(cmd.text))
+        if cmd.target in (Target.CLAUDE, Target.BOTH):
+            self.query_one("#claude_log", RichLog).write(f"─── You ───")
+            self.query_one("#claude_log", RichLog).write(cmd.text[:300])
+            self.query_one("#claude_log", RichLog).write(f"─── Claude ───")
+            asyncio.create_task(self._send_to_claude_raw(cmd.text))
+        if cmd.target in (Target.GEMINI, Target.BOTH):
+            self.query_one("#gemini_log", RichLog).write(f"─── You ───")
+            self.query_one("#gemini_log", RichLog).write(cmd.text[:300])
+            self.query_one("#gemini_log", RichLog).write(f"─── Gemini ───")
+            asyncio.create_task(self._send_to_gemini_raw(cmd.text))
 
-    async def _send_to_claude(self, text: str) -> None:
+    async def _send_to_claude_raw(self, text: str) -> None:
         if not self.claude:
             return
-        self._log_claude(f"─── You ───")
-        self._log_claude(f"{text[:300]}")
-        self._log_claude(f"─── Claude ───")
         self._update_status("Claude: working...")
         await self.claude.send(text, self._log_claude)
         self.call_from_thread(self._update_status)
 
-    async def _send_to_gemini(self, text: str) -> None:
+    async def _send_to_gemini_raw(self, text: str) -> None:
         if not self.gemini:
             return
-        self._log_gemini(f"─── You ───")
-        self._log_gemini(f"{text[:300]}")
-        self._log_gemini(f"─── Gemini ───")
         self.call_from_thread(self._update_status, "Gemini: working...")
         await self.gemini.send(text, self._log_gemini)
         self.call_from_thread(self._update_status)
@@ -395,7 +474,7 @@ class ArbiterApp(App):
         self._loop_task = asyncio.create_task(
             self._run_loop(task, rounds, stop_score)
         )
-        self._log_center_sync(f"Loop started: {rounds} rounds, stop@{stop_score}")
+        self._log_center_sync(f"Loop: {rounds} rounds, stop@{stop_score}")
         self._update_status()
 
     async def _run_loop(self, task: str, rounds: int, stop_score: float) -> None:
@@ -405,7 +484,7 @@ class ArbiterApp(App):
 
         for i in range(1, rounds + 1):
             if self._loop_cancelled:
-                self._log_center(f"Loop cancelled at round {i}.")
+                self._log_center(f"Cancelled at round {i}.")
                 break
 
             # Wait if paused
@@ -415,8 +494,8 @@ class ArbiterApp(App):
                 break
 
             # ── Builder round ──
-            self._log_center(f"━━━ Round {i}/{rounds} — Claude building ━━━")
-            self.call_from_thread(self._update_status, f"Round {i}/{rounds} — building")
+            self._log_center(f"━━ R{i}/{rounds} Building ━━")
+            self.call_from_thread(self._update_status, f"R{i}/{rounds} building")
             tracker.snapshot()
 
             bp = builder_prompt(task, i, rounds, last_verdict)
@@ -434,12 +513,10 @@ class ArbiterApp(App):
 
             # ── Judge round ──
             shots = tracker.new_files()
-            self._log_center(
-                f"━━━ Round {i}/{rounds} — Gemini judging ({len(shots)} screenshot(s)) ━━━"
-            )
+            self._log_center(f"━━ R{i}/{rounds} Judging ({len(shots)} shots) ━━")
             self.call_from_thread(
                 self._update_status,
-                f"Round {i}/{rounds} — judging ({len(shots)} shots)",
+                f"R{i}/{rounds} judging ({len(shots)} shots)",
             )
 
             jp = judge_prompt(task, i, rounds, builder_output, shots)
@@ -457,14 +534,14 @@ class ArbiterApp(App):
             last_verdict = verdict
             score = parse_score(verdict)
             self._log_center(
-                f"  Round {i} score: {score if score is not None else '?'}"
+                f"  R{i} score: {score if score is not None else '?'}"
             )
 
             if score is not None and score >= stop_score:
-                self._log_center(f"Target score reached ({score} >= {stop_score}). Done!")
+                self._log_center(f"Target reached ({score} >= {stop_score})!")
                 break
 
-        self._log_center("━━━ Loop complete ━━━")
+        self._log_center("━━ Loop complete ━━")
         self.call_from_thread(self._update_status)
 
     def _stop_everything(self) -> None:
